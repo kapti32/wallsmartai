@@ -211,28 +211,6 @@ h1{font-size:clamp(42px,5vw,68px);line-height:.98;letter-spacing:-3px;margin:15p
 <footer id="about">WallSmart · AI-assisted room paint visualization · </footer>
 
 <script>
-/*
-  WallSmart preview build — notes for the developer
-  ---------------------------------------------------
-  The original file loaded Xenova/segformer-b0-finetuned-ade-512-512 through
-  @huggingface/transformers from jsdelivr. This preview sandbox only allows
-  script imports from cdnjs.cloudflare.com and can't download a ~30MB+ model
-  on the fly, so that top-level import would have failed and taken the whole
-  page down with it (palette, upload, everything lives in that one module).
-
-  This build swaps in a dependency-free wall detector — see the "Wall
-  detection v2" comment further down for how it works (dominant-colour
-  histogram + lighting-tolerant region growing + adaptive tolerance +
-  cleanup, plus click-on-photo as a manual fallback). It's classical
-  computer vision, not a trained model, so it won't match SegFormer's
-  accuracy on a cluttered or oddly-lit real photo — swap runWallDetection()
-  back for the Transformers.js pipeline for production, where a real CDN
-  is reachable and the model download is a one-time cost, not a per-preview one.
-
-  renderPaint() below is untouched from the original — same luminance-
-  preserving blend.
-*/
-
 const colours=[
  ["#ddd4c5","Warm Linen"],["#d7c5a7","Sandstone"],["#b7c8bb","Sage Mist"],
  ["#9eaaa8","Soft Slate"],["#c9a99a","Dusty Rose"],["#e5d9bc","Ivory"],
@@ -274,7 +252,7 @@ const eraserSize=document.getElementById("eraserSize");
 const eraserSizeValue=document.getElementById("eraserSizeValue");
 const selectHelp=document.getElementById("selectHelp");
 
-const DEFAULT_INDEX=2; // Sage Mist — shows up clearly against the sample wall
+const DEFAULT_INDEX=2;
 let selected=colours[DEFAULT_INDEX];
 let imageURL=null;
 let originalImageData=null;
@@ -318,9 +296,6 @@ function rawMaskToArray(raw){
   const ch=Math.max(1,Math.round(raw.data.length/n));
   let maxValue=0;
   for(let p=0;p<n;p++) maxValue=Math.max(maxValue,Number(raw.data[p*ch]));
-  // Keep the model's soft confidence instead of thresholding it to a hard
-  // binary mask. The extra information gives the edge-refinement pass room
-  // to move a boundary without producing blocky 0/255 steps.
   const scale=maxValue<=1.01?255:1;
   for(let p=0;p<n;p++){
     const v=Math.max(0,Math.min(255,Number(raw.data[p*ch])*scale));
@@ -342,9 +317,6 @@ async function detectWallWithAI(){
     if(next.width!==first.width||next.height!==first.height) continue;
     for(let i=0;i<combined.length;i++) if(next.mask[i]>combined[i]) combined[i]=next.mask[i];
   }
-  // Keep the soft SegFormer confidence through the resize. Do not run binary
-  // morphology here: on this kind of furnished room it can shave thin wall
-  // strips or round off the boundary around frames, windows and the sofa.
   wallMask=upscaleMask(combined,first.width,first.height,originalImageData.width,originalImageData.height);
   let count=0; for(let i=0;i<combined.length;i++) if(combined[i]>127) count++;
   return count/combined.length;
@@ -414,20 +386,10 @@ removeImage.addEventListener("click",()=>{
   fileInput.value="";
   loadSampleRoom();
 });
-
-// Fit the preview box to the photo's real proportions instead of force-cropping
-// to a fixed 16:10 — clamped so a very tall/wide photo doesn't break the layout
-// (object-fit:contain on the img/canvas is the safety net for the remainder).
 function setCanvasAspect(w,h){
   const ratio=Math.min(1.9,Math.max(0.7,w/h));
   canvasWrap.style.setProperty("--ar",ratio.toFixed(4));
 }
-
-/* ---------------------------------------------------------------------
-   Custom colour wheel — hue runs around the ring, saturation runs from
-   centre to edge (drawn at a fixed 50% lightness); the slider underneath
-   controls lightness independently so any shade is reachable.
-   ------------------------------------------------------------------ */
 function drawColourWheel(){
   const size=colourWheel.width;
   const ctx=colourWheel.getContext("2d");
@@ -513,41 +475,6 @@ lightnessSlider.addEventListener("input",e=>{
 
 drawColourWheel();
 syncWheelToHex(selected[0]);
-
-/* ---------------------------------------------------------------------
-   Wall detection v2 — dominant-colour region growing.
-
-   1. findDominantWallColour(): downsample the photo, build a coarse colour
-      histogram weighted toward the upper part of the frame (soft taper, not
-      a hard cutoff), and take the biggest bin as "the wall colour" — a
-      majority vote across thousands of pixels instead of trusting a
-      handful of fixed points to land somewhere sensible.
-   2. growRegion(): flood-fills outward from that colour, but compares pixels
-      in a lighting-normalised way — luminance is scaled to match the
-      reference before measuring colour distance — so a genuine shadow/
-      highlight gradient across the same wall doesn't get rejected, while
-      a lum-ratio gate still throws out anything implausibly darker/
-      brighter (a dark picture frame, an open doorway, etc).
-   3. adaptiveDetect(): if the first pass grabs too little or too much of the
-      frame, it loosens or tightens the tolerance and tries again (up to 5
-      passes) instead of living or dying by one fixed number.
-   4. Morphological open+close cleans up speckle from photo texture/noise.
-   5. The whole analysis runs on a downsampled copy (fast + more stable
-      against per-pixel noise); the resulting mask is upscaled back onto the
-      full-resolution photo with smooth interpolation, which also softens
-      the mask edges for a more natural blend.
-
-   Tested against a synthetic photo with a strong lighting gradient, fine
-   texture noise, and a same-toned "trap" object — coverage went from a
-   noisy, fragmented ~25% (old fixed-seed approach) to a clean ~50% that
-   correctly excludes the window, a picture frame, and the furniture.
-
-   Still classical computer vision, not a trained model — it can be misled
-   by a photo with very low contrast between wall and furniture, or by
-   multiple walls in very different colours. That's what the manual
-   fallback below is for: click anywhere on the photo to use that exact
-   point as the reference colour instead.
-   ------------------------------------------------------------------ */
 const WALL_MASK_MAX_DIM=900;
 const WALL_START_TOL=26;
 const WALL_MIN_FRAC=0.10, WALL_MAX_FRAC=0.85;
@@ -567,14 +494,14 @@ function buildWorkingImageData(imgEl, maxDim){
 
 function findDominantWallColour(imageData, topWeightFrac){
   const w=imageData.width, h=imageData.height, data=imageData.data;
-  const NBINS=32; // 5-bit/channel quantisation, coarse enough to absorb lighting noise
+  const NBINS=32; 
   const binCount=NBINS*NBINS*NBINS;
   const wSum=new Float64Array(binCount);
   const rSum=new Float64Array(binCount);
   const gSum=new Float64Array(binCount);
   const bSum=new Float64Array(binCount);
   for(let y=0;y<h;y++){
-    const weight=Math.max(0.05, Math.min(1, 1-y/(topWeightFrac*h))); // soft taper, top of frame favoured
+    const weight=Math.max(0.05, Math.min(1, 1-y/(topWeightFrac*h)));
     for(let x=0;x<w;x++){
       const i=(y*w+x)*4;
       const r=data[i],g=data[i+1],b=data[i+2];
@@ -602,12 +529,11 @@ function growRegion(imageData, ref, tol){
     const r=data[i],g=data[i+1],b=data[i+2];
     const Y=calcLuminance(r,g,b);
     const lumRatio=Y/Math.max(Yref,1);
-    if(lumRatio<0.55||lumRatio>2.0) return false; // rejects "different object", keeps "same wall in shadow"
+    if(lumRatio<0.55||lumRatio>2.0) return false;
     const ratio=Math.min(4,Math.max(0.1, Yref/Math.max(Y,1)));
     const dr=r*ratio-ref[0], dg=g*ratio-ref[1], db=b*ratio-ref[2];
     return (dr*dr+dg*dg+db*db) <= tol2;
   }
-
   for(let y=0;y<bandH;y++){
     for(let x=0;x<w;x++){
       const p=y*w+x;
@@ -658,9 +584,9 @@ function erodeDilate(mask, w, h, radius, isMin){
 }
 
 function morphCleanup(mask, w, h, radius){
-  let m = erodeDilate(mask, w, h, radius, true);   // open: drop speckle
+  let m = erodeDilate(mask, w, h, radius, true); 
   m = erodeDilate(m, w, h, radius, false);
-  m = erodeDilate(m, w, h, radius, false);         // close: fill pinholes
+  m = erodeDilate(m, w, h, radius, false);       
   m = erodeDilate(m, w, h, radius, true);
   return m;
 }
@@ -704,14 +630,9 @@ function upscaleMask(mask, fromW, fromH, toW, toH){
   bctx.drawImage(small,0,0,toW,toH);
   const bigData=bctx.getImageData(0,0,toW,toH);
   const out=new Uint8ClampedArray(toW*toH);
-
-  // Keep the smooth interior, but snap ambiguous boundary pixels toward a
-  // high-contrast edge in the original image. This removes the fuzzy halo
-  // that can appear when a low-resolution segmentation mask is enlarged.
   for(let p=0;p<toW*toH;p++) out[p]=bigData.data[p*4];
   return sharpenMaskBoundary(out,toW,toH);
 }
-
 function sharpenMaskBoundary(mask,w,h){
   if(!originalImageData || originalImageData.width!==w || originalImageData.height!==h) return mask;
 
@@ -723,12 +644,6 @@ function sharpenMaskBoundary(mask,w,h){
     const i=p*4;
     luminance[p]=0.2126*src[i]+0.7152*src[i+1]+0.0722*src[i+2];
   }
-
-  // Edge-aware snapping: only touch the narrow uncertainty band around the
-  // model boundary. We follow the strongest local image edge, but only when
-  // the two sides already disagree clearly about wall/non-wall. This keeps
-  // furniture, window frames, artwork, curtains and ceiling edges from being
-  // "grown" into the wall while making the boundary visibly crisper.
   const SEARCH=6;
   const EDGE_MIN=20;
   const SNAP_STRENGTH=0.82;
@@ -779,14 +694,9 @@ function sharpenMaskBoundary(mask,w,h){
       const tdist=Math.min(1,Math.abs(bestT)/SEARCH);
       const amount=SNAP_STRENGTH*(1-0.35*tdist);
       out[p]=Math.round(m*(1-amount)+target*amount);
-
-      // Crisp the immediate edge without creating a hard painted outline.
       if(Math.abs(m-127)<105) out[p]=Math.round(out[p]*0.72+target*0.28);
     }
   }
-
-  // A very light local contrast boost on the mask only. Interior pixels are
-  // left essentially untouched; it steepens the transition at real edges.
   const sharpened=new Uint8ClampedArray(out);
   for(let y=1;y<h-1;y++){
     for(let x=1;x<w-1;x++){
@@ -799,15 +709,11 @@ function sharpenMaskBoundary(mask,w,h){
   }
   return sharpened;
 }
-
-// refOverride: an [r,g,b] to seed from directly (manual click) instead of
-// the automatic histogram — same detector underneath either way.
 async function runWallDetection(refOverride){
   if(!originalImageData || !roomImage.naturalWidth) return;
   detectButton.disabled=true;
   const canUseAI=!refOverride && !showingSample;
   status.textContent = refOverride ? "Using your selected point…" : canUseAI ? "Running semantic wall segmentation…" : "Analysing wall regions…";
-
   try{
     if(canUseAI){
       try{
@@ -859,16 +765,13 @@ async function runWallDetection(refOverride){
     detectButton.disabled=false;
   }
 }
-
 function hexToRgb(hex){
   const n=parseInt(hex.slice(1),16);
   return {r:(n>>16)&255,g:(n>>8)&255,b:n&255};
 }
-
 function rgbToHex(r,g,b){
   return "#"+[r,g,b].map(v=>Math.max(0,Math.min(255,Math.round(v))).toString(16).padStart(2,"0")).join("");
 }
-
 function hslToRgb(h,s,l){
   h=((h%360)+360)%360; s=Math.max(0,Math.min(1,s)); l=Math.max(0,Math.min(1,l));
   const c=(1-Math.abs(2*l-1))*s;
@@ -879,7 +782,6 @@ function hslToRgb(h,s,l){
   else if(h<240){r=0;g=x;b=c;} else if(h<300){r=x;g=0;b=c;} else {r=c;g=0;b=x;}
   return [(r+m)*255,(g+m)*255,(b+m)*255];
 }
-
 function rgbToHsl(r,g,b){
   r/=255; g/=255; b/=255;
   const max=Math.max(r,g,b), min=Math.min(r,g,b);
@@ -895,7 +797,6 @@ function rgbToHsl(r,g,b){
   }
   return [h,s,l];
 }
-
 function renderPaint(){
   if(!wallMask || !originalImageData) return;
   const w=originalImageData.width,h=originalImageData.height;
@@ -903,25 +804,20 @@ function renderPaint(){
   const ctx=resultCanvas.getContext("2d");
   const out=ctx.createImageData(w,h);
   const rgb=hexToRgb(selected[0]);
-
   for(let p=0;p<w*h;p++){
     const i=p*4;
     const r=originalImageData.data[i],g=originalImageData.data[i+1],b=originalImageData.data[i+2],a=originalImageData.data[i+3];
     const m=wallMask[p]/255;
-
-    // Preserve luminance/lighting while shifting the wall toward the chosen colour.
     const luminance=(0.2126*r+0.7152*g+0.0722*b)/255;
     const light=0.55+0.75*luminance;
     const paintedR=Math.min(255,rgb.r*light);
     const paintedG=Math.min(255,rgb.g*light);
     const paintedB=Math.min(255,rgb.b*light);
-
     out.data[i]=r*(1-m)+paintedR*m;
     out.data[i+1]=g*(1-m)+paintedG*m;
     out.data[i+2]=b*(1-m)+paintedB*m;
     out.data[i+3]=a;
   }
-
   ctx.putImageData(out,0,0);
   resultCanvas.style.display="block";
   roomImage.style.display="none";
@@ -932,7 +828,6 @@ function renderPaint(){
   downloadPreviewButton.style.display="block";
   refreshSaveUi();
 }
-
 removeColourButton.addEventListener("click",()=>{
   resultCanvas.style.display="none";
   roomImage.style.display="block";
@@ -943,7 +838,6 @@ removeColourButton.addEventListener("click",()=>{
   status.textContent="Showing your original photo — pick a colour or click Apply Colour to preview it again.";
   refreshSaveUi();
 });
-
 downloadPreviewButton.addEventListener("click",()=>{
   if(resultCanvas.style.display==="none") return;
   const a=document.createElement("a");
@@ -952,14 +846,7 @@ downloadPreviewButton.addEventListener("click",()=>{
   a.href=resultCanvas.toDataURL("image/png");
   a.click();
 });
-
 detectButton.addEventListener("click", ()=>{ runWallDetection(); });
-
-/* ---------------------------------------------------------------------
-   Saved rooms — persists a thumbnail + chosen colour to the signed-in
-   user's account via /api/saves-*. Guests see a "sign in to save" prompt
-   instead of the save button; nothing is saved for them.
-   ------------------------------------------------------------------ */
 const saveAccountButton=document.getElementById("saveAccountButton");
 const saveAccountPrompt=document.getElementById("saveAccountPrompt");
 const savedRoomsSection=document.getElementById("savedRoomsSection");
@@ -1029,7 +916,6 @@ function renderSavedRooms(items){
     savedRoomsGrid.appendChild(card);
   });
 }
-
 async function apiAuthed(path, opts){
   const s=wsSession();
   if(!s || !s.token) throw new Error("Not signed in.");
@@ -1061,9 +947,8 @@ async function deleteSavedRoom(id){
   try{
     const data=await apiAuthed("saves-delete", {method:"POST", body:JSON.stringify({id:id})});
     renderSavedRooms(data.items||[]);
-  }catch(err){ /* leave the list as-is on failure */ }
+  }catch(err){}
 }
-
 saveAccountButton.addEventListener("click", async function(){
   if(!hasResult()) return;
   const original=saveAccountButton.textContent;
@@ -1085,13 +970,6 @@ saveAccountButton.addEventListener("click", async function(){
 
 refreshSaveUi();
 loadSavedRooms();
-
-/* ---------------------------------------------------------------------
-   Manual correction tools.
-   - Point: click a spot and re-run detection seeded from that exact colour.
-   - AI Eraser: brush over false-positive wall areas and subtract them from
-     the current wall mask without re-running segmentation.
-   ------------------------------------------------------------------ */
 let selectionTool="point";
 let erasing=false;
 
@@ -1113,13 +991,11 @@ function setTool(tool){
     status.textContent="AI Eraser mode: drag over anything that should not be painted.";
   }
 }
-
 toolPoint.addEventListener("click",()=>setTool("point"));
 toolEraser.addEventListener("click",()=>setTool("eraser"));
 eraserSize.addEventListener("input",()=>{
   eraserSizeValue.textContent=eraserSize.value+" px";
 });
-
 function screenToNative(clientX, clientY){
   const rect=canvasWrap.getBoundingClientRect();
   const nw=roomImage.naturalWidth, nh=roomImage.naturalHeight;
@@ -1139,7 +1015,7 @@ function screenToNative(clientX, clientY){
 function handlePointClick(e){
   const {nx,ny,cx,cy,boxW,boxH,inBounds}=screenToNative(e.clientX,e.clientY);
   if(!inBounds || !originalImageData) return;
-  clickMarker.style.width="22px";
+  clickMarker.style.width="24px";
   clickMarker.style.height="22px";
   clickMarker.style.left=(cx/boxW*100)+"%";
   clickMarker.style.top=(cy/boxH*100)+"%";
@@ -1164,7 +1040,6 @@ function eraseAt(clientX,clientY){
   const minY=Math.max(0,Math.floor(cy-radius-2));
   const maxY=Math.min(h-1,Math.ceil(cy+radius+2));
   const softEdge=Math.max(2,radius*0.22);
-
   for(let y=minY;y<=maxY;y++){
     const dy=y-cy;
     for(let x=minX;x<=maxX;x++){
@@ -1179,7 +1054,6 @@ function eraseAt(clientX,clientY){
   renderPaint();
   return true;
 }
-
 function updateEraserCursor(e){
   if(selectionTool!=="eraser") return;
   const {cx,cy,scale,inBounds}=screenToNative(e.clientX,e.clientY);
@@ -1194,12 +1068,10 @@ function updateEraserCursor(e){
   clickMarker.style.top=cy+"px";
   clickMarker.style.display="block";
 }
-
 function resetClickMarker(){
   clickMarker.style.width="22px";
   clickMarker.style.height="22px";
 }
-
 canvasWrap.addEventListener("pointerdown", e=>{
   if(!originalImageData || !roomImage.naturalWidth) return;
   if(selectionTool!=="eraser") return;
@@ -1212,12 +1084,10 @@ canvasWrap.addEventListener("pointerdown", e=>{
   eraseAt(e.clientX,e.clientY);
   updateEraserCursor(e);
 });
-
 canvasWrap.addEventListener("pointermove", e=>{
   if(selectionTool==="eraser") updateEraserCursor(e);
   if(erasing) eraseAt(e.clientX,e.clientY);
 });
-
 canvasWrap.addEventListener("pointerup", e=>{
   if(selectionTool==="eraser"){
     erasing=false;
@@ -1227,12 +1097,10 @@ canvasWrap.addEventListener("pointerup", e=>{
   }
   handlePointClick(e);
 });
-
 canvasWrap.addEventListener("pointercancel",()=>{ erasing=false; });
 canvasWrap.addEventListener("pointerleave",()=>{
   if(selectionTool==="eraser" && !erasing) clickMarker.style.display="none";
 });
-
 applyButton.addEventListener("click",()=>{
   if(!currentFile){
     status.textContent="Upload a room image first.";
@@ -1245,11 +1113,6 @@ applyButton.addEventListener("click",()=>{
   }
   renderPaint();
 });
-
-/* ---------------------------------------------------------------------
-   Sample room — an original illustration (not a photo), loaded
-   automatically so this preview shows a finished result right away.
-   ------------------------------------------------------------------ */
 const ROOM_SVG=`<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1000" viewBox="0 0 1600 1000">
   <defs>
     <linearGradient id="wall" x1="0" y1="0" x2="1" y2="1">
@@ -1302,7 +1165,6 @@ const ROOM_SVG=`<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="100
   <rect x="1532" y="770" width="20" height="34" rx="3" fill="#3d3128"/>
 </svg>`;
 const ROOM_IMAGE_SRC="data:image/svg+xml;charset=utf-8,"+encodeURIComponent(ROOM_SVG);
-
 async function loadSampleRoom(){
   currentFile="sample-room";
   showingSample=true;
@@ -1313,12 +1175,10 @@ async function loadSampleRoom(){
   removeImage.style.display="none";
   detectButton.style.display="block";
   status.textContent="Sample room loaded. Detecting walls…";
-
   await new Promise(resolve=>{
     if(roomImage.complete && roomImage.naturalWidth) resolve();
     else roomImage.onload=resolve;
   });
-
   const temp=document.createElement("canvas");
   temp.width=roomImage.naturalWidth;
   temp.height=roomImage.naturalHeight;
@@ -1331,16 +1191,8 @@ async function loadSampleRoom(){
   setTool("point");
   removeColourButton.style.display="none";
   downloadPreviewButton.style.display="none";
-
   await runWallDetection();
 }
-
-/* ---------------------------------------------------------------------
-   Opening animation — the big centred wordmark IS the loading state; once
-   the sample room is actually ready (not a fake delay) it shrinks and
-   slides up into its real nav position while the overlay scrolls away
-   behind it, landing right as the real nav logo is uncovered.
-   ------------------------------------------------------------------ */
 function alignLoadingLogoToNav(){
   const navRect=navLogo.getBoundingClientRect();
   const logoRect=loadingLogo.getBoundingClientRect();
@@ -1366,9 +1218,8 @@ function revealSite(){
 
 async function runIntro(){
   const start=Date.now();
-  const MIN_DURATION=1000; // let the animation read as intentional even when loading is instant
-  const SAFETY_TIMEOUT=4000; // never block the reveal indefinitely if something goes wrong
-
+  const MIN_DURATION=1000;
+  const SAFETY_TIMEOUT=4000;
   try{
     await Promise.race([
       loadSampleRoom(),
@@ -1377,10 +1228,8 @@ async function runIntro(){
   }catch(err){
     console.error(err);
   }
-
   const remaining=MIN_DURATION-(Date.now()-start);
   if(remaining>0) await new Promise(r=>setTimeout(r,remaining));
-
   revealSite();
 }
 runIntro();
